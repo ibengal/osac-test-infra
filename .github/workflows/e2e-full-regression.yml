@@ -811,9 +811,10 @@ jobs:
 
       # OSAC-5922: use the image the cluster actually pulled, including any
       # Helm image override. Prefer its digest so a mutable :latest tag cannot
-      # move between installation and CLI extraction; use the pod's image
-      # reference when the runtime does not report a pullable digest.
-      - name: Extract OSAC CLI from deployed fulfillment-service image
+      # move between installation and CLI extraction. If the runtime does not
+      # report a pullable digest, copy the CLI from the running pod instead.
+      - name: Resolve deployed fulfillment-service image
+        id: deployed-cli-image
         if: env.OSAC_CLI_BIN == '' && inputs.osac-cli-version == ''
         env:
           KUBECONFIG: ${{ runner.temp }}/kubeconfig
@@ -833,16 +834,24 @@ jobs:
             exit 1
           fi
           image_id=$(jq -r '.status.containerStatuses[] | select(.name == "grpc-server") | .imageID // empty' <<< "${pod}")
-          image_ref=$(jq -r '.spec.containers[] | select(.name == "grpc-server") | .image // empty' <<< "${pod}")
           image_id="${image_id#docker-pullable://}"
           if [[ "${image_id}" == *@sha256:* ]]; then
             image="${image_id}"
-          elif [[ -n "${image_ref}" ]]; then
-            echo "::warning::No pullable digest for the running fulfillment-service image; using its pod image reference"
-            image="${image_ref}"
           else
-            echo "::error::Could not resolve an image for the running fulfillment-service pod"
-            exit 1
+            pod_name=$(jq -r '.metadata.name // empty' <<< "${pod}")
+            if [[ -z "${pod_name}" ]]; then
+              echo "::error::Could not resolve the running fulfillment-service pod name"
+              exit 1
+            fi
+            echo "::warning::No pullable digest for the running fulfillment-service image; copying its CLI from the pod"
+            if ! oc exec "${pod_name}" -n "${INSTALLER_NAMESPACE}" -c grpc-server -- cat /usr/local/bin/osac > "$RUNNER_TEMP/osac-cli-bin"; then
+              rm -f "$RUNNER_TEMP/osac-cli-bin"
+              echo "::error::Could not copy the OSAC CLI from the running fulfillment-service pod"
+              exit 1
+            fi
+            chmod +x "$RUNNER_TEMP/osac-cli-bin"
+            echo "pod-cli-path=$RUNNER_TEMP/osac-cli-bin" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           echo "Extracting OSAC CLI from deployed fulfillment-service image"
           for attempt in 1 2 3; do
@@ -856,29 +865,32 @@ jobs:
             echo "::warning::Image pull failed (attempt ${attempt}/3); retrying in 5s"
             sleep 5
           done
-          if ! cli_container=$(podman create "${image}" 2>/dev/null); then
-            echo "::error::Could not create a container from the deployed fulfillment-service image"
-            exit 1
-          fi
-          trap 'podman rm "${cli_container}" >/dev/null 2>&1 || true' EXIT
-          podman cp "${cli_container}:/usr/local/bin/osac" "$RUNNER_TEMP/osac-cli-bin"
-          chmod +x "$RUNNER_TEMP/osac-cli-bin"
-          echo "OSAC_CLI_BIN=$RUNNER_TEMP/osac-cli-bin" >> "$GITHUB_ENV"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+
+      - name: Extract OSAC CLI from deployed fulfillment-service image
+        id: deployed-cli
+        if: env.OSAC_CLI_BIN == '' && inputs.osac-cli-version == '' && steps.deployed-cli-image.outputs.image != ''
+        uses: ./.github/actions/extract-osac-cli
+        with:
+          image: ${{ steps.deployed-cli-image.outputs.image }}
 
       - name: Build test image
         env:
           E2E_IMAGE: "osac-e2e-tests:${{ github.run_id }}"
           OSAC_VERSION: ${{ inputs.osac-cli-version }}
+          DEPLOYED_CLI_BIN: ${{ steps.deployed-cli.outputs.path }}
+          POD_CLI_BIN: ${{ steps.deployed-cli-image.outputs.pod-cli-path }}
         run: |
           set -euo pipefail
           trap 'rm -f ./osac-cli-bin' EXIT
           BUILD_ARGS=(--build-arg "OSAC_VERSION=${OSAC_VERSION}")
-          if [[ -n "${OSAC_CLI_BIN:-}" ]]; then
-            if [[ ! -f "${OSAC_CLI_BIN}" ]]; then
-              echo "::error::OSAC_CLI_BIN does not point to a file: ${OSAC_CLI_BIN}"
+          CLI_BIN="${OSAC_CLI_BIN:-${DEPLOYED_CLI_BIN:-${POD_CLI_BIN:-}}}"
+          if [[ -n "${CLI_BIN}" ]]; then
+            if [[ ! -f "${CLI_BIN}" ]]; then
+              echo "::error::Selected OSAC CLI does not point to a file"
               exit 1
             fi
-            cp "${OSAC_CLI_BIN}" ./osac-cli-bin
+            cp "${CLI_BIN}" ./osac-cli-bin
             BUILD_ARGS=(--build-arg "OSAC_CLI_BIN=osac-cli-bin")
           elif [[ -z "${OSAC_VERSION}" ]]; then
             echo "::error::No CLI extracted from fulfillment-service and no explicit osac-cli-version was provided"

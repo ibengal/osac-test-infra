@@ -43,7 +43,7 @@ runs:
         # -based fallback for exactly that case, gated on this output being
         # a real, existing file.
         if ! podman run --rm --entrypoint sh "${IMAGE}" -c 'test -f /usr/local/bin/osac' >/dev/null 2>&1; then
-          echo "::warning::No /usr/local/bin/osac found in ${IMAGE} -- this image may predate the CLI being baked in (see osac-project/osac's fulfillment-service/Containerfile). Falling back to the caller's own default CLI resolution."
+          echo "::warning::No /usr/local/bin/osac found in the fulfillment-service image; this image may predate the CLI being baked in (see osac-project/osac's fulfillment-service/Containerfile). The caller will decide how to proceed."
           echo "path=" >> "$GITHUB_OUTPUT"
           exit 0
         fi
@@ -56,7 +56,10 @@ runs:
           exit 1
         fi
 
-        container_id=$(podman create "${IMAGE}")
+        if ! container_id=$(podman create "${IMAGE}" 2>/dev/null); then
+          echo "::error::Could not create a container from the fulfillment-service image"
+          exit 1
+        fi
         trap 'podman rm "${container_id}" >/dev/null 2>&1 || true' EXIT
         podman cp "${container_id}:/usr/local/bin/osac" "${OUTPUT_PATH}"
 
